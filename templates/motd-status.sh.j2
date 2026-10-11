@@ -1,0 +1,33 @@
+#!/bin/bash
+# Dynamic MOTD: LNMP host status (runs as root via pam_motd on login).
+D=$'\e[0m'; B=$'\e[1;36m'; DIM=$'\e[2m'; G=$'\e[1;32m'; R=$'\e[1;31m'
+. /etc/os-release 2>/dev/null
+
+svc() { systemctl is-active "$1" >/dev/null 2>&1 && printf '%sup%s' "$G" "$D" || printf '%sdown%s' "$R" "$D"; }
+
+mem=$(free -m | awk '/^Mem:/{printf "%d/%d MB (%d%%)", $3, $2, $3*100/$2}')
+rootfs=$(df -h / | awk 'NR==2{print $5" of "$2}')
+srvfs=$(df -h /srv 2>/dev/null | awk 'NR==2{print $5" of "$2}')
+load=$(cut -d' ' -f1-3 /proc/loadavg)
+up=$(uptime -p 2>/dev/null | sed 's/^up //')
+
+f2b=0; jails=0; bans=""
+if command -v fail2ban-client >/dev/null 2>&1; then
+  for j in $(fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr ',' ' '); do
+    n=$(fail2ban-client status "$j" 2>/dev/null | sed -n 's/.*Currently banned:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+    [ -n "$n" ] || continue
+    jails=$((jails + 1)); f2b=$((f2b + n))
+    [ "$n" -gt 0 ] && bans="${bans:+$bans }$j:$n"
+  done
+fi
+
+printf '\n %s%s%s — %s\n' "$B" "$(hostname)" "$D" "${PRETTY_NAME:-Linux}"
+printf ' %suptime%s %s    %sload%s %s\n' "$DIM" "$D" "${up:-?}" "$DIM" "$D" "$load"
+printf ' %smem%s %s    %sdisk%s /: %s   /srv: %s\n' "$DIM" "$D" "$mem" "$DIM" "$D" "$rootfs" "${srvfs:-n/a}"
+printf ' %ssvc%s nginx:%s php:%s mariadb:%s\n' "$DIM" "$D" "$(svc nginx)" "$(svc php{{ php_version }}-fpm)" "$(svc mariadb)"
+if [ "$f2b" -gt 0 ]; then
+  printf ' %sfail2ban%s %s%s banned%s / %s jail(s)   %s%s%s\n' "$DIM" "$D" "$R" "$f2b" "$D" "$jails" "$R" "$bans" "$D"
+else
+  printf ' %sfail2ban%s %sno active bans%s / %s jail(s)\n' "$DIM" "$D" "$G" "$D" "$jails"
+fi
+printf ' %snote%s wp-config.php is 440 (read-only by design) — chmod u+w to edit, then 440\n\n' "$DIM" "$D"

@@ -1,0 +1,130 @@
+# Read-only checks that the per-site isolation model holds on the server (see ACL_DESIGN.md).
+# Each check runs for every site and fails listing all sites that break it; individual files
+# outside the model are listed under FLAGGED instead. Checks also run under --check. HTTP
+# checks connect to this host directly (--resolve), so they work before DNS points here; a
+# site still on its seed self-signed cert passes (-k).
+
+---
+
+- name: 7. Validate the isolation model
+  hosts: webservers
+  roles:
+    - repo_defaults
+  vars:
+    site_root: "{{ item.root | default(web_root_base ~ '/' ~ item.name) }}"
+  tasks:
+    - name: Web root is a directory, 0750, owned by the site user
+      ansible.builtin.stat:
+        path: "{{ site_root }}"
+      register: v_root
+      loop: "{{ users }}"
+      loop_control: { label: "{{ item.name }}" }
+      failed_when: >-
+        not v_root.stat.exists or not v_root.stat.isdir or v_root.stat.mode != '0750'
+        or v_root.stat.pw_name != item.name or v_root.stat.gr_name != item.name
+
+    - name: nginx read access comes from access + default ACLs
+      ansible.builtin.command: getfacl -p {{ site_root | quote }}
+      register: v_acl
+      loop: "{{ users }}"
+      loop_control: { label: "{{ item.name }}" }
+      changed_when: false
+      check_mode: false
+      failed_when: >-
+        v_acl.stdout is not search('(?m)^user:nginx:r-x')
+        or v_acl.stdout is not search('(?m)^default:user:nginx:r-x')
+
+    - name: nginx can read and traverse the web root
+      ansible.builtin.command: runuser -u nginx -- test -r {{ site_root | quote }} -a -x {{ site_root | quote }}
+      loop: "{{ users }}"
+      loop_control: { label: "{{ item.name }}" }
+      changed_when: false
+      check_mode: false
+
+    - name: nginx cannot write to the web root
+      ansible.builtin.command: runuser -u nginx -- test -w {{ site_root | quote }}
+      register: v_nginx_write
+      loop: "{{ users }}"
+      loop_control: { label: "{{ item.name }}" }
+      changed_when: false
+      check_mode: false
+      failed_when: v_nginx_write.rc == 0
+
+    # Files a plugin or a manual change left outside the model are reported for manual
+    # fixing, not failed: WordPress core creates files via insert_with_markers() with at
+    # least 0644 (e.g. plugin .htaccess files). Up to 20 paths per test and site.
+    - name: Find files with world access, x in the ACL mask, or a foreign owner
+      ansible.builtin.shell: |
+        find {{ site_root | quote }} -perm /o+rwx -printf '%m %u:%g world access: %p\n' | head -20
+        find {{ site_root | quote }} -type f -perm /g+x ! -perm /u+x -printf '%m %u:%g x in ACL mask: %p\n' | head -20
+        find {{ site_root | quote }} \( ! -user {{ item.name | quote }} -o ! -group {{ item.name | quote }} \) -printf '%m %u:%g foreign owner: %p\n' | head -20
+      register: v_tree
+      loop: "{{ users }}"
+      loop_control: { label: "{{ item.name }}" }
+      changed_when: false
+      check_mode: false
+
+    - name: FLAGGED — files to fix by hand (does not fail the run)
+      ansible.builtin.debug:
+        msg: "{{ v_tree.results | selectattr('stdout', 'truthy') | map(attribute='stdout_lines') | flatten }}"
+      when: v_tree.results | selectattr('stdout', 'truthy') | list | length > 0
+
+    - name: wp-config.php is 0440 where present
+      ansible.builtin.stat:
+        path: "{{ site_root }}/wp-config.php"
+      register: v_wpconfig
+      loop: "{{ users | selectattr('php_enabled', 'defined') | selectattr('php_enabled') | list }}"
+      loop_control: { label: "{{ item.name }}" }
+      failed_when: v_wpconfig.stat.exists and v_wpconfig.stat.mode != '0440'
+
+    - name: php-fpm socket exists, owned nginx:nginx, mode 0600
+      ansible.builtin.stat:
+        path: "/run/php/{{ item.name }}-fpm.sock"
+      register: v_sock
+      loop: "{{ users | selectattr('php_enabled', 'defined') | selectattr('php_enabled') | list }}"
+      loop_control: { label: "{{ item.name }}" }
+      failed_when: >-
+        not v_sock.stat.exists or not v_sock.stat.issock or v_sock.stat.mode != '0600'
+        or v_sock.stat.pw_name != 'nginx' or v_sock.stat.gr_name != 'nginx'
+
+    - name: php-fpm does not listen on TCP
+      ansible.builtin.shell: ss -tlnpH | grep php-fpm || true
+      register: v_fpm_tcp
+      changed_when: false
+      check_mode: false
+      failed_when: v_fpm_tcp.stdout | length > 0
+
+    - name: Site answers without a server error
+      ansible.builtin.command: >-
+        curl -sk -o /dev/null -w '%{http_code}' --max-time 15
+        --resolve {{ item.domain[0] }}:{{ web_port }}:127.0.0.1 {{ scheme }}://{{ item.domain[0] }}/
+      vars:
+        scheme: "{{ 'https' if item.tls | default(false) else 'http' }}"
+        web_port: "{{ 443 if item.tls | default(false) else 80 }}"
+      register: v_http
+      loop: "{{ users }}"
+      loop_control: { label: "{{ item.name }}" }
+      changed_when: false
+      check_mode: false
+      failed_when: v_http.stdout is not match('^[1-4][0-9][0-9]$')
+
+    - name: PHP in uploads is not executed (403 or 404)
+      ansible.builtin.command: >-
+        curl -sk -o /dev/null -w '%{http_code}' --max-time 15
+        --resolve {{ item.domain[0] }}:{{ web_port }}:127.0.0.1 {{ scheme }}://{{ item.domain[0] }}/wp-content/uploads/probe.php
+      vars:
+        scheme: "{{ 'https' if item.tls | default(false) else 'http' }}"
+        web_port: "{{ 443 if item.tls | default(false) else 80 }}"
+      register: v_upload_php
+      loop: "{{ users | selectattr('php_enabled', 'defined') | selectattr('php_enabled') | list }}"
+      loop_control: { label: "{{ item.name }}" }
+      changed_when: false
+      check_mode: false
+      failed_when: v_upload_php.stdout not in ['403', '404']
+
+    - name: nftables ruleset is loaded
+      ansible.builtin.command: nft list tables
+      register: v_nft
+      changed_when: false
+      check_mode: false
+      failed_when: v_nft.rc != 0 or v_nft.stdout | length == 0

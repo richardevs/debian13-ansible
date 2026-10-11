@@ -1,0 +1,195 @@
+# Migrate each site's database from the OLD server: dump on the source, copy over the
+# private network, import here, then point wp-config.php at the new DB user.
+#
+# The source needs PyMySQL for the dump ("A MySQL module is required"):
+#   apt install python3-pymysql
+# Freeze writes on the source first, so no new data is lost after the dump:
+#   mariadb -e "SET GLOBAL read_only = ON"
+# (WordPress's DB users cannot write while read_only is on; root still can.)
+
+---
+
+- hosts: webservers
+  roles:
+    - repo_defaults
+  remote_user: root
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tasks:
+    - name: Interlock — migration runs pre-cutover only
+      ansible.builtin.assert:
+        that: cutover_phase | default('post-cutover') == 'pre-cutover'
+        fail_msg: >-
+          cutover_phase='{{ cutover_phase | default('unset') }}'. Migration re-imports the
+          DB from the (frozen) source — running post-cutover clobbers the live DB with stale
+          data. Set cutover_phase: pre-cutover in the inventory only while migrating.
+        quiet: true
+      delegate_to: localhost
+      run_once: true
+
+    - name: Ensure wp-cli is installed on the destination (checksum-verified)
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+        dest: /usr/local/bin/wp
+        mode: '0755'
+        checksum: "sha512:https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar.sha512"
+
+    - name: Install wp-cli bash completion
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/wp-cli/wp-cli/main/utils/wp-completion.bash
+        dest: /etc/bash_completion.d/wp
+        mode: '0644'
+
+    # Guard against a non-graceful abort (kill/power loss) that skipped the
+    # always-cleanup below and left a stale snapshot on disk. A normal task
+    # failure can't reach here — always cleans up — so this only trips on the
+    # rare hard-abort or a manually-placed dump.
+    - name: Preflight — scan for stale dumps on source
+      ansible.builtin.find:
+        paths: /root/db_dumps
+        patterns: '*.sql'
+      register: stale_src
+      delegate_to: '{{ migrate_src_ip }}'
+
+    - name: Preflight — scan for stale dumps on dest
+      ansible.builtin.find:
+        paths: /root/db_dumps
+        patterns: '*.sql'
+      register: stale_dest
+
+    - name: Preflight — refuse to run if stale dumps exist (don't import an old snapshot)
+      ansible.builtin.assert:
+        that:
+          - stale_src.files | length == 0
+          - stale_dest.files | length == 0
+        fail_msg: >-
+          Stale .sql found in /root/db_dumps (src={{ stale_src.files | length }},
+          dest={{ stale_dest.files | length }}). A prior run aborted non-gracefully.
+          Remove them before re-running so a stale snapshot is never imported.
+        quiet: true
+
+    - name: Migrate and configure DBs (dumps cleaned up even on failure)
+      block:
+        - name: Creating source folder /root/db_dumps (for security concerns)
+          ansible.builtin.file:
+            path: /root/db_dumps
+            state: directory
+            owner: root
+            mode:  '700'
+          delegate_to: '{{ migrate_src_ip }}'
+
+        - name: Creating dest folder /root/db_dumps (for security concerns)
+          ansible.builtin.file:
+            path: /root/db_dumps
+            state: directory
+            owner: root
+            mode:  '700'
+
+        - name: Dumping the database
+          ansible.mariadb.mariadb_db:
+            state: dump
+            name: '{{ item.migrate.db }}'
+            target: /root/db_dumps/{{ item.migrate.db }}.sql
+            login_unix_socket: /run/mysqld/mysqld.sock
+          with_items: '{{ users }}'
+          when:
+            - item.migrate.db is defined
+            - item.php_enabled == true
+          delegate_to: '{{ migrate_src_ip }}'
+
+        - name: Push dump to dest (private IP)
+          ansible.builtin.command:
+            argv:
+              - rsync
+              - -t
+              - --checksum
+              - -e
+              - ssh -o StrictHostKeyChecking=accept-new
+              - "/root/db_dumps/{{ item.migrate.db }}.sql"
+              - "root@{{ migrate_dest_ip }}:/root/db_dumps/{{ item.migrate.db }}.sql"
+          with_items: '{{ users }}'
+          when:
+            - item.migrate.db is defined
+            - item.php_enabled | default(false)
+          delegate_to: '{{ migrate_src_ip }}'
+          changed_when: true
+
+        - name: Drop the DB once due to when state is import, it will import the dump file each time if run more than once.
+          ansible.mariadb.mariadb_db:
+            name: "{{ item.db_name | default(item.name) }}"
+            state: absent
+            login_unix_socket: /run/mysqld/mysqld.sock
+          with_items: '{{ users }}'
+          when:
+            - item.migrate.db is defined
+            - item.php_enabled == true
+
+        - name: Recreating the dropped DB....
+          ansible.mariadb.mariadb_db:
+            name: "{{ item.db_name | default(item.name) }}"
+            state: present
+            login_unix_socket: /run/mysqld/mysqld.sock
+          with_items: '{{ users }}'
+          when:
+            - item.migrate.db is defined
+            - item.php_enabled == true
+
+        - name: Restoring from dump
+          ansible.mariadb.mariadb_db:
+            name: "{{ item.db_name | default(item.name) }}"
+            state: import
+            target: /root/db_dumps/{{ item.migrate.db }}.sql
+            login_unix_socket: /run/mysqld/mysqld.sock
+          with_items: '{{ users }}'
+          when:
+            - item.migrate.db is defined
+            - item.php_enabled == true
+
+        - name: Read each site's DB password from the server (written by 5-create-db)
+          ansible.builtin.slurp:
+            src: "/root/.db/{{ item.name }}.psw"
+          register: db_passwords
+          with_items: '{{ users }}'
+          when:
+            - item.migrate.db is defined
+            - item.php_enabled == true
+          no_log: true
+
+        # https://make.wordpress.org/cli/handbook/guides/installing/#recommended-installation
+        # The WordPress baseline (constants, wp-fail2ban, auto-updates) is 5a-wordpress.yaml;
+        # run main.yaml (or 5a-wordpress.yaml) after the migration.
+        - name: Point wp-config.php at the new database and DB user
+          ansible.builtin.shell: |
+            if [ -f wp-config.php ]; then
+                set -e
+                chmod u+w wp-config.php
+                wp config set DB_HOST localhost
+                wp config set DB_NAME {{ (item.db_name | default(item.name)) | quote }}
+                wp config set DB_USER {{ item.name | quote }}
+                wp config set DB_PASSWORD "$DB_PASSWORD"
+                chmod 440 wp-config.php
+                wp core is-installed
+            fi
+          with_items: '{{ users }}'
+          become_user: '{{ item.name }}'
+          become: yes
+          environment:
+            DB_PASSWORD: "{{ (db_passwords.results | selectattr('item.name', 'equalto', item.name) | selectattr('content', 'defined') | map(attribute='content') | first | default('') | b64decode) }}"
+          no_log: true
+          args:
+            executable: /bin/bash
+            chdir: "{{ item.root | default(web_root_base + '/' + item.name) }}"
+          when:
+            - item.migrate.db is defined
+            - item.php_enabled == true
+      always:
+        - name: Clean up dumps on source (runs even if the block failed)
+          ansible.builtin.file:
+            path: /root/db_dumps
+            state: absent
+          delegate_to: '{{ migrate_src_ip }}'
+
+        - name: Clean up dumps on dest (runs even if the block failed)
+          ansible.builtin.file:
+            path: /root/db_dumps
+            state: absent

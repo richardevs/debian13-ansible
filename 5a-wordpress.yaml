@@ -1,0 +1,90 @@
+# WordPress baseline for every php_enabled site that has a wp-config.php (sites without one,
+# e.g. before WordPress is installed, are skipped; re-run after installing it):
+#   - wp-config.php constants from wp_config_constants (file/dir modes the ACL model needs,
+#     no dashboard file editor, wp-fail2ban log tags, core auto-updates)
+#   - wp-fail2ban installed and active; installed at the version of the fail2ban filters
+#     (wpf2b_ref), with a notice when the installed version differs
+#   - plugin auto-updates on, except plugins in wp_plugin_auto_updates_exclude
+# Only what differs is changed; --check reports it without changing anything. Runs as the
+# site user with plugins and themes not loaded.
+
+---
+
+- name: 5a. WordPress baseline (wp-config constants, wp-fail2ban, auto-updates)
+  hosts: webservers
+  roles:
+    - repo_defaults
+  tasks:
+    - name: Ensure wp-cli is installed (checksum-verified)
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+        dest: /usr/local/bin/wp
+        mode: '0755'
+        checksum: "sha512:https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar.sha512"
+
+    - name: Apply the WordPress baseline per site
+      ansible.builtin.shell: |
+        set -euo pipefail
+        [ -f wp-config.php ] || { echo "SKIP no wp-config.php"; exit 0; }
+        wp() { /usr/local/bin/wp --skip-plugins --skip-themes --no-color "$@"; }
+        change() { echo "CHANGED $SITE: $*"; }
+        unlocked=0
+        unlock() { if [ "$unlocked" = 0 ]; then chmod u+w wp-config.php; unlocked=1; fi; }
+        trap '[ "$unlocked" = 0 ] || chmod 440 wp-config.php' EXIT
+
+        while IFS='=' read -r name value; do
+          [ -n "$name" ] || continue
+          grep -qE "define\(\s*['\"]${name}['\"]\s*,\s*${value}\s*\)" wp-config.php && continue
+          change "constant $name = $value"
+          [ "$DRY" = 1 ] && continue
+          unlock
+          # a translated wp-config.php lacks the English anchor wp-cli places new constants at
+          wp config set "$name" "$value" --raw --type=constant --quiet \
+            || wp config set "$name" "$value" --raw --type=constant --anchor='<?php' --placement=after --quiet
+        done <<< "$CONSTANTS"
+
+        if ! wp plugin is-installed wp-fail2ban; then
+          change "install wp-fail2ban ${F2B_VERSION:-latest}"
+          [ "$DRY" = 1 ] || wp plugin install wp-fail2ban ${F2B_VERSION:+--version="$F2B_VERSION"} --quiet
+        fi
+        if [ "$DRY" = 0 ] || wp plugin is-installed wp-fail2ban; then
+          if ! wp plugin is-active wp-fail2ban; then
+            change "activate wp-fail2ban"
+            [ "$DRY" = 1 ] || wp plugin activate wp-fail2ban --quiet
+          fi
+          have=$(wp plugin get wp-fail2ban --field=version 2>/dev/null || true)
+          if [ -n "$F2B_VERSION" ] && [ -n "$have" ] && [ "$have" != "$F2B_VERSION" ]; then
+            echo "NOTICE $SITE: wp-fail2ban $have installed; fail2ban filters are for $F2B_VERSION (wpf2b_ref)"
+          fi
+        fi
+
+        if [ "$AUTO_UPDATES" = 1 ]; then
+          for p in $(wp plugin auto-updates status --all --disabled-only --field=name); do
+            case " $EXCLUDE " in *" $p "*) continue ;; esac
+            change "auto-updates on: $p"
+            [ "$DRY" = 1 ] || wp plugin auto-updates enable "$p" --quiet
+          done
+        fi
+      args:
+        executable: /bin/bash
+        chdir: "{{ item.root | default(web_root_base ~ '/' ~ item.name) }}"
+      environment:
+        HOME: "/home/{{ item.name }}"
+        SITE: "{{ item.name }}"
+        DRY: "{{ '1' if ansible_check_mode else '0' }}"
+        CONSTANTS: "{% for k, v in wp_config_constants.items() %}{{ k }}={{ v }}\n{% endfor %}"
+        F2B_VERSION: "{{ '' if wpf2b_ref == 'trunk' else wpf2b_ref | regex_replace('^tags/', '') }}"
+        AUTO_UPDATES: "{{ '1' if wp_plugin_auto_updates else '0' }}"
+        EXCLUDE: "{{ wp_plugin_auto_updates_exclude | join(' ') }}"
+      become: true
+      become_user: "{{ item.name }}"
+      register: wp_baseline
+      loop: "{{ users | selectattr('php_enabled', 'defined') | selectattr('php_enabled') | list }}"
+      loop_control: { label: "{{ item.name }}" }
+      check_mode: false
+      changed_when: "'CHANGED' in wp_baseline.stdout"
+
+    - name: Changes and notices
+      ansible.builtin.debug:
+        msg: "{{ wp_baseline.results | selectattr('stdout', 'search', 'CHANGED|NOTICE') | map(attribute='stdout_lines') | flatten }}"
+      when: wp_baseline.results | selectattr('stdout', 'search', 'CHANGED|NOTICE') | list | length > 0

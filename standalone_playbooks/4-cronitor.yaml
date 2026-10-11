@@ -1,0 +1,54 @@
+# 4. CronitorCLI — job monitoring for the backup and acme cron entries.
+# Installs the pinned release binary to /usr/bin/cronitor (checksum-verified).
+#
+# One-time, interactive, on the server (browser sign-in; stores a machine
+# credential in /etc/cronitor/cronitor.json, 0600):
+#   cronitor auth login --no-browser
+# Then set `cronitor_enabled: true` in the inventory and re-run standalone 3 and 7 and
+# 6-acme-sh so their cron entries run under `cronitor exec`.
+# Monitor keys: backup-db-daily, backup-offsite-weekly, acme-renew, malware-scan.
+
+---
+
+- name: 4. CronitorCLI
+  hosts: webservers
+  roles:
+    - repo_defaults
+  vars:
+    cronitor_version: "33.8"
+    cronitor_arch: "{{ 'arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64' }}"
+    cronitor_sha256:        # release tarball (published .sha256)
+      amd64: d3793470590a1cacc34c9353b0fa3fa877dcbded9575914e5f5a6d32488d9559
+      arm64: 4f3b79d9740818cb2d68a3a24c8416a05f90af6bc0244997f65c87153bb2fb52
+    cronitor_bin_sha256:    # extracted binary; the CLI has no --version flag
+      amd64: 30aac6b11e578741b034afa9ed0cd795549f6b89393f90fd30ff99288a65e232
+      arm64: 800ebb1848aa4c0d3adb4ee2902b7879af17d1acc05cf2d45d5faad2ebf7d202
+  tasks:
+    - name: Check installed CronitorCLI binary
+      ansible.builtin.stat:
+        path: /usr/bin/cronitor
+        checksum_algorithm: sha256
+      register: cronitor_installed
+
+    - name: Download CronitorCLI {{ cronitor_version }} ({{ cronitor_arch }})
+      ansible.builtin.get_url:
+        url: "https://github.com/cronitorio/cronitor-cli/releases/download/{{ cronitor_version }}/linux_{{ cronitor_arch }}.tar.gz"
+        dest: /tmp/cronitor.tar.gz
+        checksum: "sha256:{{ cronitor_sha256[cronitor_arch] }}"
+      when: cronitor_installed.stat.checksum | default('') != cronitor_bin_sha256[cronitor_arch]
+
+    - name: Install cronitor into /usr/bin
+      ansible.builtin.unarchive:
+        src: /tmp/cronitor.tar.gz
+        dest: /usr/bin
+        remote_src: yes
+        include: [cronitor]
+        owner: root
+        group: root
+        mode: '0755'
+      when: cronitor_installed.stat.checksum | default('') != cronitor_bin_sha256[cronitor_arch]
+
+    - name: Remove download
+      ansible.builtin.file:
+        path: /tmp/cronitor.tar.gz
+        state: absent

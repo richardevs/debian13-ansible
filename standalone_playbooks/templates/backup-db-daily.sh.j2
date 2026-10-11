@@ -1,0 +1,33 @@
+#!/bin/bash
+# Daily DB backup: encrypted all-databases dump into staging, move dumps older
+# than 2 days to the local archive, prune the archive past 14 days, mirror
+# staging to OSS (if set). Exits non-zero if any step fails, including mysqldump.
+#
+# Restore: openssl enc -d -aes-256-cbc -pbkdf2 -pass pass:<{{ db_dump_secret }}> -in d-….sql.enc
+set -euo pipefail
+umask 077
+
+staging=/srv/backup/db
+archive=/root/.baks/db
+
+log() { echo "$(date +%FT%T%z) $*"; }
+
+out="$staging/d-$(date +%Y-%m-%dT%H:%M%z).sql.enc"
+trap 'rm -f "$out.part"; log "FAILED (line $LINENO)"' ERR
+
+DUMP_PASS=$(gcloud secrets versions access latest --secret={{ db_dump_secret }})
+export DUMP_PASS
+# pass via env, not argv
+mysqldump --all-databases --single-transaction --quick \
+  | openssl enc -aes-256-cbc -pbkdf2 -pass env:DUMP_PASS > "$out.part"
+unset DUMP_PASS
+mv "$out.part" "$out"
+log "dump $(stat -c %s "$out") bytes -> $out"
+
+find "$staging" -name 'd-*.sql.enc' -mtime +2 -exec mv -t "$archive"/ {} +
+find "$archive" -name 'd-*.sql.enc' -mtime +14 -delete
+
+{% if oss_bucket %}
+ossutil sync "$staging" oss://{{ oss_bucket }}/db --acl private --update --delete --force
+{% endif %}
+log "OK"

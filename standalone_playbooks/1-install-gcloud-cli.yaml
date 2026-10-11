@@ -1,0 +1,82 @@
+# Install the Google Cloud CLI (apt package) and activate a service account.
+# GCS on a non-GCP (Alibaba) host has no metadata role, so a service-account
+# KEY is unavoidable here. <inventory>/secrets/gcloud_service_account.json is optional once the server
+# has an active account; provide it to activate or rotate the key.
+# Grant it only: Storage Object Admin on the bucket + Secret Manager Secret Accessor.
+
+---
+
+- name: Install Google Cloud CLI + activate service account
+  hosts: webservers
+  roles:
+    - repo_defaults
+  tasks:
+    - name: Install apt prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - gnupg
+          - curl
+          - jq
+        state: present
+        update_cache: yes
+
+    - name: Import the Google Cloud public key (dearmored)
+      ansible.builtin.shell: >
+        curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+      args:
+        creates: /usr/share/keyrings/cloud.google.gpg
+
+    - name: Add the gcloud apt source (idempotent, no duplicate entries)
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/google-cloud-sdk.list
+        content: "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main\n"
+
+    - name: Install google-cloud-cli
+      ansible.builtin.apt:
+        name: google-cloud-cli
+        state: latest
+        update_cache: yes
+
+    # A local key file activates (or rotates) the account; without one the server's
+    # active account is kept, and the run fails only when neither exists.
+    - name: Check for a local service-account key
+      ansible.builtin.stat:
+        path: "{{ inventory_dir }}/secrets/gcloud_service_account.json"
+      register: gcloud_local_key
+      delegate_to: localhost
+      become: false
+
+    - name: Read the server's active gcloud account
+      ansible.builtin.command: gcloud auth list --filter=status:ACTIVE --format=value(account)
+      register: gcloud_active
+      changed_when: false
+      check_mode: false
+
+    - name: Fail when there is no key locally and no active account on the server
+      ansible.builtin.fail:
+        msg: >-
+          No <inventory>/secrets/gcloud_service_account.json and no active gcloud account on the server.
+          Create a key for the service account in the GCP console, save it there, and re-run.
+      when: not gcloud_local_key.stat.exists and gcloud_active.stdout | length == 0
+
+    - name: Keep the server's active account (no local key)
+      ansible.builtin.debug:
+        msg: "Already activated: {{ gcloud_active.stdout }}"
+      when: not gcloud_local_key.stat.exists
+
+    - name: Copy service-account key
+      ansible.builtin.copy:
+        src: "{{ inventory_dir }}/secrets/gcloud_service_account.json"
+        dest: /root/.gcloud_service_account.json
+        mode: '0600'
+      when: gcloud_local_key.stat.exists
+
+    - name: Activate service account and set project
+      ansible.builtin.shell: |
+        gcloud auth activate-service-account --key-file=/root/.gcloud_service_account.json --quiet
+        gcloud config set project "$(jq -r '.project_id' /root/.gcloud_service_account.json)" --quiet
+      environment:
+        CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
+      when: gcloud_local_key.stat.exists

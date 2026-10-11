@@ -1,0 +1,106 @@
+# Per php-enabled site: a MariaDB database + scoped user (ALL on its own DB only).
+# MariaDB 11.4+ uses unix_socket root auth by default (no root password needed).
+# A DB user's password is set only when the user is created: generated on the server
+# into /root/.db/<name>.psw (0600) and never stored on the control machine. Existing
+# users keep their password; the copy in each site's wp-config.php is authoritative.
+
+---
+- name: 5. Per-site databases and DB users
+  hosts: webservers
+  roles:
+    - repo_defaults
+  tasks:
+    - name: Create per-site database
+      ansible.mariadb.mariadb_db:
+        name: "{{ item.db_name | default(item.name) }}"
+        state: present
+        login_unix_socket: /run/mysqld/mysqld.sock
+      with_items: '{{ users }}'
+      when: item.db_enabled | default(item.php_enabled | default(false))
+
+    - name: Read existing DB users
+      ansible.builtin.command: mariadb -NBe "SELECT User FROM mysql.global_priv WHERE Host = 'localhost'"
+      register: db_existing_users
+      changed_when: false
+      check_mode: false
+
+    - name: DB password folder (root only)
+      ansible.builtin.file:
+        path: /root/.db
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    # force: false keeps a file left by an earlier run that stopped before the user was created
+    - name: Generate a password on the server for each new DB user
+      ansible.builtin.copy:
+        dest: "/root/.db/{{ item.name }}.psw"
+        content: "{{ lookup('ansible.builtin.password', '/dev/null', length=32, chars=['ascii_letters', 'digits']) }}"
+        force: false
+        owner: root
+        group: root
+        mode: '0600'
+      with_items: '{{ users }}'
+      when:
+        - item.db_enabled | default(item.php_enabled | default(false))
+        - item.name not in db_existing_users.stdout_lines
+      no_log: true
+
+    - name: Read the passwords of new DB users
+      ansible.builtin.slurp:
+        src: "/root/.db/{{ item.name }}.psw"
+      register: db_new_passwords
+      with_items: '{{ users }}'
+      when:
+        - item.db_enabled | default(item.php_enabled | default(false))
+        - item.name not in db_existing_users.stdout_lines
+        - not ansible_check_mode
+      no_log: true
+
+    - name: Create per-site DB user (scoped ALL on own DB); password only on create
+      ansible.mariadb.mariadb_user:
+        name: "{{ item.name }}"
+        password: "{{ (db_new_passwords.results | selectattr('item.name', 'equalto', item.name) | selectattr('content', 'defined') | map(attribute='content') | first | default('') | b64decode) or omit }}"
+        update_password: on_create  # betterleaks:allow
+        priv: "{{ item.db_name | default(item.name) }}.*:ALL"
+        state: present
+        login_unix_socket: /run/mysqld/mysqld.sock
+      with_items: '{{ users }}'
+      when: item.db_enabled | default(item.php_enabled | default(false))
+      no_log: true
+
+    # mysql_secure_installation equivalents (OWASP DB hardening)
+    - name: Remove anonymous MariaDB users
+      ansible.mariadb.mariadb_user:
+        name: ''
+        host_all: true
+        state: absent
+        login_unix_socket: /run/mysqld/mysqld.sock
+
+    - name: Drop the test database if present
+      ansible.mariadb.mariadb_db:
+        name: test
+        state: absent
+        login_unix_socket: /run/mysqld/mysqld.sock
+
+    - name: Ensure binlog directory exists (when enabled)
+      ansible.builtin.file:
+        path: /var/log/mysql
+        state: directory
+        owner: mysql
+        mode: '2750'
+      when: enable_binlog | default(false)
+      notify: Restart MariaDB
+
+    - name: Install MariaDB config drop-in (hardening; binlog when enabled)
+      ansible.builtin.template:
+        src: templates/mariadb-custom.cnf.j2
+        dest: /etc/mysql/mariadb.conf.d/99-custom.cnf
+      notify: Restart MariaDB
+
+  handlers:
+    - name: Restart MariaDB
+      ansible.builtin.systemd:
+        name: mariadb
+        state: restarted

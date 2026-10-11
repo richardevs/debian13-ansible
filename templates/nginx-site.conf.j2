@@ -1,0 +1,69 @@
+{# Per-site server block. Two layers of extensibility:
+   1. structured knobs (hsts.*, php_enabled, tls) with sane defaults below
+   2. an escape-hatch `include` for the unpredictable tail — hand-written
+      overrides in snippets/<name>.extra.conf survive every Ansible re-run.
+   Set once in the inventory (users:); edit generated confs never. #}
+{% set site_root = item.root | default(web_root_base ~ '/' ~ item.name) %}
+{% set h = item.hsts | default({}) %}
+server {
+    server_name         {% for i in item.domain %}{{ i }} {% endfor %};
+    root                {{ site_root }};
+
+    ssl_certificate_key "/root/.certs/{{ item.name }}/key.pem";
+    ssl_certificate     "/root/.certs/{{ item.name }}/fullchain.pem";
+
+    listen 443 ssl;
+    listen [::]:443 ssl;
+
+    include snippets/ssl.conf;
+    include snippets/common.conf;
+
+    add_header Strict-Transport-Security "max-age={{ h.max_age | default(63072000) }}{% if h.include_subdomains | default(true) %}; includeSubDomains{% endif %}{% if h.preload | default(false) %}; preload{% endif %}" always;
+
+{% if item.php_enabled | default(false) %}
+    index index.php index.html;
+
+    location = /xmlrpc.php {
+        deny all;
+        access_log off;
+        error_log /dev/null;
+    }
+
+    # No PHP execution inside upload/content dirs (blocks webshell drops)
+    location ~* /(?:wp-content|uploads|files)/.*\.php$ {
+        deny all;
+    }
+
+    # Block version-disclosure / sample files
+    location ~* ^/(readme\.html|license\.txt|wp-config-sample\.php)$ {
+        deny all;
+    }
+
+    # Defence-in-depth: never serve wp-config.php (exact match beats the \.php$ proxy)
+    location = /wp-config.php {
+        deny all;
+    }
+
+    # WordPress front controller
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    location ~ \.php$ {
+        try_files $uri =404;
+        #NOTE: cgi.fix_pathinfo = 0 must be set in php.ini
+        include fastcgi_params;
+        fastcgi_intercept_errors on;
+        fastcgi_pass unix:/run/php/{{ item.name }}-fpm.sock;
+        fastcgi_param  SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param  PHP_ADMIN_VALUE open_basedir={{ site_root }}:/tmp;
+    }
+{% else %}
+    location / {
+        try_files $uri $uri/ $uri/index.html =404;
+    }
+{% endif %}
+
+    # Per-site escape hatch: created empty-if-missing by 4-nginx.yaml, never clobbered.
+    include snippets/{{ item.name }}.extra.conf;
+}

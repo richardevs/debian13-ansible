@@ -1,0 +1,88 @@
+# Per site: a login user (SSH/SFTP only) + a web root under /srv/www.
+# Web root is 750/640; nginx reads via POSIX ACL, not world bits.
+
+---
+
+- name: 2. Per-site login users + web roots + ACLs
+  hosts: webservers
+  roles:
+    - repo_defaults
+  tasks:
+    - name: Check for existing login-user SSH keys
+      ansible.builtin.stat:
+        path: "/home/{{ item.name }}/.ssh/id_ed25519"
+      register: user_keys
+      loop: "{{ users }}"
+      loop_control: { label: "{{ item.name }}" }
+
+    - name: Create login users (ed25519 key, no password)
+      ansible.builtin.user:
+        name: "{{ item.name }}"
+        generate_ssh_key: "{{ not (user_keys.results | selectattr('item.name', 'equalto', item.name) | first).stat.exists }}"
+        ssh_key_type: ed25519
+      with_items: '{{ users }}'
+
+    - name: Lock down home directories (login only, no web content)
+      ansible.builtin.file:
+        path: "/home/{{ item.name }}"
+        state: directory
+        owner: "{{ item.name }}"
+        group: "{{ item.name }}"
+        mode: '0750'
+      with_items: '{{ users }}'
+
+    - name: Ensure web root base exists
+      ansible.builtin.file:
+        path: "{{ web_root_base }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create per-site web root (750, no world access)
+      ansible.builtin.file:
+        path: "{{ item.root | default(web_root_base + '/' + item.name) }}"
+        state: directory
+        owner: "{{ item.name }}"
+        group: "{{ item.name }}"
+        mode: '0750'
+      with_items: '{{ users }}'
+
+    # Convenience: ~/public_html -> web root, for SFTP/SSH muscle memory.
+    # Purely for humans — nginx serves the real /srv path. (Breaks under SFTP chroot.)
+    - name: Symlink ~/public_html to the web root
+      ansible.builtin.file:
+        path: "/home/{{ item.name }}/public_html"
+        src: "{{ item.root | default(web_root_base + '/' + item.name) }}"
+        state: link
+        owner: "{{ item.name }}"
+        group: "{{ item.name }}"
+        follow: false
+      with_items: '{{ users }}'
+
+    # Access ACL: nginx read on what exists now.
+    # Files carry latent x on group::/user:nginx (inherited from the dir-shaped
+    # default ACL). Any `setfacl -m` here WITHOUT -n recomputes mask::r-x, which puts x
+    # in every file's mask (see ACL_DESIGN.md) — keep recalculate_mask: no_mask.
+    - name: Grant nginx read via access ACL
+      ansible.posix.acl:
+        path: "{{ item.root | default(web_root_base + '/' + item.name) }}"
+        entity: nginx
+        etype: user
+        permissions: rX
+        recursive: yes
+        recalculate_mask: no_mask   # keep files' born-with mask r-- (not green/executable); nginx still reads
+        state: present
+      with_items: '{{ users }}'
+
+    # Default ACL: new files (rsync, WP updates) inherit nginx read automatically.
+    - name: Grant nginx read via default ACL (inherited by new files)
+      ansible.posix.acl:
+        path: "{{ item.root | default(web_root_base + '/' + item.name) }}"
+        entity: nginx
+        etype: user
+        permissions: rX
+        default: yes
+        recursive: yes
+        state: present
+      with_items: '{{ users }}'

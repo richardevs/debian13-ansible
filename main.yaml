@@ -1,0 +1,37 @@
+# Provision a Nginx + MariaDB + PHP environment on Debian 13 (trixie).
+# Per-site UID isolation, unix-socket php-fpm, ACL-based nginx read,
+# nftables + fail2ban.
+#
+# How-to:
+#   ansible-playbook main.yaml -v
+# Drift/dry-run (unreliable for command/shell + acme tasks — treat as "unknown"):
+#   ansible-playbook main.yaml --check --diff
+
+---
+
+- name: 1. Base system, packages, PHP, MariaDB, nginx, firewall
+  ansible.builtin.import_playbook: 1-install.yaml
+
+- name: 2. Per-site login users + web roots + ACLs
+  ansible.builtin.import_playbook: 2-create-users.yaml
+
+- name: 3. Per-site php-fpm pools (unix sockets)
+  ansible.builtin.import_playbook: 3-php-fpm.yaml
+
+- name: 4. nginx vhosts (TLS + apm log_format)
+  ansible.builtin.import_playbook: 4-nginx.yaml
+
+- name: 4a. fail2ban jails (WordPress journald + nginx logs)
+  ansible.builtin.import_playbook: 4a-fail2ban.yaml
+
+- name: 5. Per-site databases and DB users
+  ansible.builtin.import_playbook: 5-create-db.yaml
+
+- name: 5a. WordPress baseline (wp-config constants, wp-fail2ban, auto-updates)
+  ansible.builtin.import_playbook: 5a-wordpress.yaml
+
+- name: 6. acme.sh + Let's Encrypt certificates (needs everything up)
+  ansible.builtin.import_playbook: 6-acme-sh.yaml
+
+- name: 7. Validate the isolation model (read-only checks)
+  ansible.builtin.import_playbook: 7-validate.yaml

@@ -1,0 +1,212 @@
+---
+
+- name: 1. Base system, packages, PHP, MariaDB, nginx, firewall
+  hosts: webservers
+  roles:
+    - repo_defaults
+  tasks:
+    - name: Set timezone
+      community.general.timezone:
+        name: "{{ timezone }}"
+
+    # Explicit sshd policy via drop-in (Debian 13 sshd_config Includes sshd_config.d/*).
+    # Root stays reachable by key for Ansible; password auth off; verbose logging.
+    - name: Harden sshd (drop-in)
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/10-hardening.conf
+        content: |
+          LogLevel VERBOSE
+          PermitRootLogin prohibit-password
+          PasswordAuthentication no
+          Port 22
+          LoginGraceTime 30
+          MaxAuthTries 3
+        validate: /usr/sbin/sshd -t -f %s
+      notify: Restart ssh
+
+    - name: Install dynamic MOTD status script
+      ansible.builtin.template:
+        src: templates/motd-status.sh.j2
+        dest: /etc/update-motd.d/99-status
+        mode: '0755'
+
+    # Debian 13 no longer reads /etc/sysctl.conf at boot. systemd-sysctl applies files in
+    # name order and the last value wins: 99-zz sorts after cloud-image 99-* drop-ins
+    # (e.g. Alibaba's 99-apsara-sysctl.conf, whose swappiness 0 this overrides).
+    - name: Enable BBR - default_qdisc fq
+      ansible.posix.sysctl:
+        name: net.core.default_qdisc
+        value: 'fq'
+        sysctl_file: /etc/sysctl.d/99-zz-sysctl-tuning.conf
+        state: present
+
+    - name: Enable BBR - tcp_congestion_control bbr
+      ansible.posix.sysctl:
+        name: net.ipv4.tcp_congestion_control
+        value: 'bbr'
+        sysctl_file: /etc/sysctl.d/99-zz-sysctl-tuning.conf
+        state: present
+
+    - name: Create swapfile
+      ansible.builtin.command: "fallocate -l {{ swap_size_mb }}M /swapfile"
+      args:
+        creates: /swapfile
+      register: swapfile_created
+      when: swap_size_mb | int > 0
+
+    - name: Secure and format swapfile
+      when: swapfile_created is changed
+      block:
+        - ansible.builtin.file:
+            path: /swapfile
+            mode: '0600'
+        - ansible.builtin.command: mkswap /swapfile
+        - ansible.builtin.command: swapon /swapfile
+
+    - name: Persist swapfile in fstab
+      ansible.posix.mount:
+        path: none
+        src: /swapfile
+        fstype: swap
+        opts: sw
+        state: present
+      when: swap_size_mb | int > 0
+
+    - name: Set vm.swappiness low (swap as a safety net, not a crutch)
+      ansible.posix.sysctl:
+        name: vm.swappiness
+        value: '10'
+        sysctl_file: /etc/sysctl.d/99-zz-sysctl-tuning.conf
+        state: present
+      when: swap_size_mb | int > 0
+
+    - name: Remove these keys from /etc/sysctl.conf (not read at boot on Debian 13)
+      ansible.builtin.lineinfile:
+        path: /etc/sysctl.conf
+        regexp: '^\s*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control|vm\.swappiness)\s*='
+        state: absent
+
+    - name: Update all packages to latest
+      ansible.builtin.apt:
+        name: "*"
+        state: latest
+        update_cache: yes
+        autoremove: yes
+
+    - name: Base tools + dependencies
+      ansible.builtin.apt:
+        name:
+          - jq
+          - acl
+          - git
+          - htop
+          - tmux
+          - nmap
+          - curl
+          - tree
+          - iftop
+          - vnstat
+          - nftables
+          - fail2ban
+          - ssl-cert
+          - conntrack
+          - python3-pymysql
+          - python3-systemd   # required for fail2ban's systemd/journald backend (WP jails)
+          - systemd-timesyncd
+          - unattended-upgrades
+          - apt-transport-https
+          - ca-certificates
+          - gnupg2
+          - bash-completion
+        state: latest
+
+    - name: Enable unattended-upgrades
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+
+    - name: Add nginx origin for unattended-upgrades (drop-in, keeps stock 50)
+      ansible.builtin.copy:
+        src: files/52origins-nginx
+        dest: /etc/apt/apt.conf.d/52origins-nginx
+
+    - name: Import nginx.org signing key (dearmored)
+      ansible.builtin.shell: >
+        curl -fsSL https://nginx.org/keys/nginx_signing.key
+        | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg
+      args:
+        creates: /usr/share/keyrings/nginx-archive-keyring.gpg
+
+    - name: Configure nginx.org apt repo (mainline)
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/nginx.list
+        content: "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/mainline/debian {{ ansible_facts['distribution_release'] }} nginx\n"
+
+    - name: Pin nginx.org packages above the distro's
+      ansible.builtin.copy:
+        dest: /etc/apt/preferences.d/99nginx
+        content: |
+          Package: *
+          Pin: origin nginx.org
+          Pin: release o=nginx
+          Pin-Priority: 900
+
+    - name: Install nginx (nginx.org mainline)
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+        update_cache: yes
+
+    - name: Install MariaDB server (Debian native, 11.8 LTS)
+      ansible.builtin.apt:
+        name:
+          - mariadb-server
+        state: latest
+
+    # https://make.wordpress.org/hosting/handbook/server-environment/#php-extensions
+    - name: Install PHP {{ php_version }} + extensions
+      ansible.builtin.apt:
+        name:
+          - "php{{ php_version }}"
+          - "php{{ php_version }}-fpm"
+          - "php{{ php_version }}-mbstring"
+          - "php{{ php_version }}-imagick"
+          - "php{{ php_version }}-xml"
+          - "php{{ php_version }}-zip"
+          - "php{{ php_version }}-opcache"
+          - "php{{ php_version }}-mysql"
+          - "php{{ php_version }}-intl"
+          - "php{{ php_version }}-curl"
+        state: latest
+
+    - name: Shell niceties — color prompt, ls/grep color, wp completion
+      ansible.builtin.blockinfile:
+        path: "{{ item }}"
+        marker: "# {mark} ANSIBLE MANAGED: shell niceties"
+        create: true
+        block: |
+          alias ls='ls --color=auto'
+          alias ll='ls -alF'
+          alias la='ls -A'
+          alias grep='grep --color=auto'
+          [ -x /usr/bin/dircolors ] && eval "$(dircolors -b)"
+          if [ "$(id -u)" -eq 0 ]; then
+              PS1='\[\e[1;31m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]# '
+          else
+              PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
+          fi
+          [ -f /etc/bash_completion.d/wp ] && . /etc/bash_completion.d/wp
+      loop:
+        - /root/.bashrc
+        - /etc/skel/.bashrc
+
+    # No host firewall ruleset — cloud security groups do port filtering;
+    # nftables is present only for fail2ban's ban set.
+
+  handlers:
+    - name: Restart ssh
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted

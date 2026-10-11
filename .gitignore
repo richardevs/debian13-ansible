@@ -1,0 +1,9 @@
+# Your inventory (or a clone of your private inventory repo); see inventory.example/
+/inventory/
+# Personal agent instructions
+CLAUDE.local.md
+# Pre-inventory layout, kept ignored so old local copies never get committed
+/secrets/
+/settings.yaml
+.vault_pass
+CUTOVER.md

@@ -1,0 +1,27 @@
+# Defaults for every play (role defaults: lowest precedence). Override any of them in the
+# inventory — hosts.yml or group_vars/ (see inventory.example/).
+
+---
+timezone: Etc/UTC            # server timezone (tz database name)
+
+php_version: "8.4"          # Debian 13 native; path-templated everywhere
+web_root_base: /srv/www     # site roots are {{ web_root_base }}/<name>
+acme_challenge: http          # http (HTTP-01 webroot) or dns (DNS-01); a site can override it
+acme_dns_plugin: ""           # acme.sh dnsapi name for DNS-01, e.g. dns_cf, dns_cloudns
+acme_dns_cred_keys: []        # account.conf keys that plugin needs (prompted when missing)
+acme_dnssleep: 60             # fixed wait for DNS propagation before LE verifies
+acme_email: ""                # ACME account email for Let's Encrypt expiry notices
+wpf2b_ref: "tags/5.4.2"       # WP fail2ban plugin version for filter fetch; bump on plugin update (or "trunk")
+enable_binlog: false          # MariaDB binary logs for local point-in-time recovery (off = simpler, dumps only)
+wp_config_constants:          # wp-config.php constants set by 5a-wordpress (raw PHP values)
+  FS_CHMOD_FILE: "0640"        # files WordPress writes stay in the ACL model (no world read)
+  FS_CHMOD_DIR: "0750"
+  DISALLOW_FILE_EDIT: "true"   # no theme/plugin file editor in the dashboard
+  WP_AUTO_UPDATE_CORE: "true"  # all core updates, including major versions
+  WP_FAIL2BAN_SYSLOG_SHORT_TAG: "false"   # log tag the WordPress fail2ban jails match
+  WP_FAIL2BAN_SYSLOG_TAG_HOST: "false"
+wp_plugin_auto_updates: true  # 5a-wordpress turns plugin auto-updates on...
+wp_plugin_auto_updates_exclude: []   # ...except for these plugin slugs
+gcs_bucket: ""                # standalone backups: Google Cloud Storage destination (empty = skip)
+oss_bucket: ""                # standalone backups: Alibaba Cloud OSS destination (empty = skip)
+swap_size_mb: 2048            # swapfile size in MB (0 disables) — safety net on small-RAM VMs

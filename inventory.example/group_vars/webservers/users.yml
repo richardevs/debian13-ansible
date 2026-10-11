@@ -1,0 +1,34 @@
+# FORMAT — each entry is one login user + one website:
+#
+#   - name:            # login user + pool + default db/root identity (required)
+#     domain:          # nginx server_name + acme -d flags (required, list)
+#       - example.com
+#       - www.example.com
+#     php_enabled: true   # true => php-fpm pool + WP nginx block + a database
+#     tls: true           # true => acme.sh issues a certificate for this site
+#     acme_challenge:     # optional, http or dns; default = acme_challenge (http)
+#     preload_enabled:    # (deprecated; use hsts.preload)
+#     db_name:            # optional, default = name
+#     root:               # optional, default = {{ web_root_base }}/<name>
+#     hsts:               # optional structured knobs (all have defaults)
+#       max_age: 63072000
+#       include_subdomains: true
+#       preload: false
+#     migrate:            # optional, only for standalone migration playbooks
+#       src: /home/example/public_html   # source path on the OLD server
+#       db: example                       # source DB name (optional)
+
+---
+users:
+
+  - name: example
+    domain:
+      - example.com
+      - www.example.com
+    php_enabled: true
+    tls: true
+    hsts:
+      preload: true
+    migrate:
+      src: /home/example/public_html
+      db: example

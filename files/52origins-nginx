@@ -1,0 +1,4 @@
+// Auto-update nginx from the nginx.org repo via unattended-upgrades.
+Unattended-Upgrade::Origins-Pattern {
+        "origin=nginx,codename=${distro_codename},label=nginx";
+};

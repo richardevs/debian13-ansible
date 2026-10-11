@@ -1,0 +1,119 @@
+# nginx: TLS snippets + per-site vhosts + the apm log_format. (fail2ban jails
+# that read these logs live in 4a-fail2ban.yaml.)
+
+---
+
+- name: 4. nginx vhosts (TLS + apm log_format)
+  hosts: webservers
+  roles:
+    - repo_defaults
+  tasks:
+    - name: Ensure snippets dir exists
+      ansible.builtin.file:
+        path: /etc/nginx/snippets
+        state: directory
+
+    - name: Import shared SSL config (TLS only)
+      ansible.builtin.copy:
+        src: files/nginx-ssl.conf
+        dest: /etc/nginx/snippets/ssl.conf
+
+    - name: Import common server policy (headers + shared locations)
+      ansible.builtin.copy:
+        src: files/nginx-common.conf
+        dest: /etc/nginx/snippets/common.conf
+
+    - name: Per-site cert directory
+      ansible.builtin.file:
+        path: /root/.certs/{{ item.name }}
+        state: directory
+        mode: '0700'
+      with_items: '{{ users }}'
+
+    - name: Seed snakeoil key until acme.sh replaces it
+      ansible.builtin.copy:
+        src: /etc/ssl/private/ssl-cert-snakeoil.key
+        dest: /root/.certs/{{ item.name }}/key.pem
+        remote_src: yes
+        force: false
+      with_items: '{{ users }}'
+
+    - name: Seed snakeoil cert until acme.sh replaces it
+      ansible.builtin.copy:
+        src: /etc/ssl/certs/ssl-cert-snakeoil.pem
+        dest: /root/.certs/{{ item.name }}/fullchain.pem
+        remote_src: yes
+        force: false
+      with_items: '{{ users }}'
+
+    # Escape hatch: hand-written per-site overrides. Created empty ONCE and
+    # never clobbered (force:false), so re-runs don't wipe your edits.
+    - name: Create per-site override snippet if missing
+      ansible.builtin.copy:
+        dest: /etc/nginx/snippets/{{ item.name }}.extra.conf
+        content: |
+          # Per-site nginx overrides for {{ item.name }}. Safe from Ansible re-runs.
+          # WARNING: nginx add_header is all-or-nothing per level. If you add an
+          # add_header inside a location{} here, that location DROPS every header
+          # from common.conf — re-add them (or `include snippets/common.conf;`) in that block.
+        force: false
+      with_items: '{{ users }}'
+
+    - name: Generate per-site vhost
+      ansible.builtin.template:
+        src: templates/nginx-site.conf.j2
+        dest: /etc/nginx/conf.d/{{ item.name }}.conf
+      with_items: '{{ users }}'
+
+    - name: Remove the package's stock default.conf (welcome server)
+      ansible.builtin.file:
+        path: /etc/nginx/conf.d/default.conf
+        state: absent
+
+    - name: Install our catch-all default server (own slot, after 00-tuning)
+      ansible.builtin.copy:
+        src: files/nginx-default.conf
+        dest: /etc/nginx/conf.d/01-default.conf
+
+    - name: Install http tuning drop-in (keeps stock nginx.conf)
+      ansible.builtin.copy:
+        src: files/nginx-tuning.conf
+        dest: /etc/nginx/conf.d/00-tuning.conf
+
+    # log_format must precede the http-level access_log (both before the
+    # conf.d include), so this is a managed edit of nginx.conf, not a drop-in.
+    - name: Define the apm log_format at the top of http{} in nginx.conf
+      ansible.builtin.blockinfile:
+        path: /etc/nginx/nginx.conf
+        marker: "    # {mark} ANSIBLE MANAGED: apm log_format"
+        insertafter: '^http\s*{'
+        block: |
+          log_format apm '"$time_local" server_name=$server_name host=$host client=$remote_addr '
+              'method=$request_method request="$request" '
+              'request_length=$request_length '
+              'status=$status bytes_sent=$bytes_sent '
+              'body_bytes_sent=$body_bytes_sent '
+              'referer="$http_referer" '
+              'user_agent="$http_user_agent" '
+              'upstream_addr=$upstream_addr '
+              'upstream_status=$upstream_status '
+              'request_time=$request_time '
+              'upstream_response_time=$upstream_response_time '
+              'upstream_connect_time=$upstream_connect_time '
+              'upstream_header_time=$upstream_header_time';
+
+    - name: Point the http-level access_log at the apm format
+      ansible.builtin.lineinfile:
+        path: /etc/nginx/nginx.conf
+        regexp: '^\s*access_log\s+/var/log/nginx/access\.log\s+\w+;'
+        line: '    access_log  /var/log/nginx/access.log  apm;'
+
+    - name: Validate nginx configuration
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+        daemon_reload: true

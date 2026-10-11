@@ -1,0 +1,10 @@
+---
+# Control-node collections. Install: ansible-galaxy collection install -r requirements.yml
+# Ranges: tested minimum, below the next major version. Needs ansible-core >= 2.18.
+collections:
+  - name: ansible.mariadb    # MariaDB modules (not ansible.mysql — it drops MariaDB)
+    version: ">=6.0.2,<7.0.0"
+  - name: ansible.posix      # sysctl, acl, synchronize
+    version: ">=2.2.2,<3.0.0"
+  - name: community.general  # timezone
+    version: ">=13.5.0,<14.0.0"

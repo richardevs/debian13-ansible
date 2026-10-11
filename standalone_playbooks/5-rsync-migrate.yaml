@@ -1,0 +1,96 @@
+# Migrate site files from the OLD server into the new /srv/www/<name>.
+# Runs rsync delegated to the source host. Lands files with clean perms
+# (dirs 750 / files 640, no world access) and re-applies the nginx read ACL,
+# so the multi-tenant boundary holds even for freshly-synced files.
+#
+# Tip: cheaper to run this ON the source instance so it connects to dest via
+# internal IP. Manually add the source host's SSH pubkey to dest first.
+# Warning: delete=true — files in dest not present in src are removed.
+
+---
+
+- hosts: webservers
+  roles:
+    - repo_defaults
+  remote_user: root
+  tasks:
+    - name: Interlock — migration runs pre-cutover only
+      ansible.builtin.assert:
+        that: cutover_phase | default('post-cutover') == 'pre-cutover'
+        fail_msg: >-
+          cutover_phase='{{ cutover_phase | default('unset') }}'. Migration overwrites the
+          dest from the (frozen) source — running post-cutover clobbers the live VM with
+          stale data. Set cutover_phase: pre-cutover in the inventory only while migrating.
+        quiet: true
+      delegate_to: localhost
+      run_once: true
+
+    - name: Preflight — stat each source path on the source host
+      ansible.builtin.stat:
+        path: "{{ item.migrate.src }}"
+      loop: "{{ users }}"
+      loop_control: { label: "{{ item.name }}" }
+      when: item.migrate.src is defined
+      register: src_stat
+      delegate_to: '{{ migrate_src_ip }}'
+
+    - name: Preflight — fail if a source path is missing or not a directory
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isdir
+        fail_msg: "Source {{ item.item.migrate.src }} missing or not a dir on {{ migrate_src_ip }}"
+        quiet: true
+      loop: "{{ src_stat.results }}"
+      loop_control: { label: "{{ item.item.name }}" }
+      when: not (item.skipped | default(false))
+
+    # rsync runs ON the source and pushes to the dest's PRIVATE IP (VPC-internal,
+    # free) — not the public IP the control machine uses.
+    - name: Sync source public_html -> dest web root (private IP)
+      ansible.builtin.command:
+        argv:
+          - rsync
+          - -rt
+          - --delete
+          - --chmod=D750,F640
+          - -e
+          - ssh -o StrictHostKeyChecking=accept-new
+          - "{{ item.migrate.src }}/"
+          - "root@{{ migrate_dest_ip }}:{{ item.root | default(web_root_base + '/' + item.name) }}/"
+      with_items: '{{ users }}'
+      when: item.migrate.src is defined
+      delegate_to: '{{ migrate_src_ip }}'
+      changed_when: true
+
+    - name: Fix ownership after sync
+      ansible.builtin.file:
+        path: "{{ item.root | default(web_root_base + '/' + item.name) }}"
+        state: directory
+        recurse: yes
+        owner: "{{ item.name }}"
+        group: "{{ item.name }}"
+      with_items: '{{ users }}'
+      when: item.migrate.src is defined
+
+    # no_mask is required: a plain `setfacl -m` (mask recompute) puts the latent x on
+    # group::/user:nginx into every file's mask. See 2-create-users.yaml.
+    - name: Re-apply nginx read ACL over synced tree
+      ansible.posix.acl:
+        path: "{{ item.root | default(web_root_base + '/' + item.name) }}"
+        entity: nginx
+        etype: user
+        permissions: rX
+        recursive: yes
+        recalculate_mask: no_mask   # keep files' rsync'd mask r-- (not green/executable); nginx still reads
+        state: present
+      with_items: '{{ users }}'
+      when: item.migrate.src is defined
+
+    - name: Tighten wp-config.php to 440 where present
+      ansible.builtin.file:
+        path: "{{ item.root | default(web_root_base + '/' + item.name) }}/wp-config.php"
+        mode: '0440'
+      with_items: '{{ users }}'
+      when: item.migrate.src is defined
+      failed_when: false

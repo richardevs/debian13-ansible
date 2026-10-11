@@ -1,0 +1,10 @@
+[mariadb]
+skip-name-resolve
+local-infile      = 0
+{% if enable_binlog | default(false) %}
+
+# binary logs (local point-in-time recovery)
+log_bin           = /var/log/mysql/mysql-bin.log
+expire_logs_days  = 2
+max_binlog_size   = 100M
+{% endif %}

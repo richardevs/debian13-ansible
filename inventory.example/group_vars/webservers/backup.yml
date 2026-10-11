@@ -1,0 +1,7 @@
+# standalone_playbooks/3-backup-init.yaml.
+# Bucket and secret names only; the secrets themselves live in GCP Secret Manager.
+
+---
+gcs_bucket: your-gcs-bucket
+oss_bucket: your-oss-bucket
+db_dump_secret: example-db-dump-pass         # GCP secret: DB dump encryption pass

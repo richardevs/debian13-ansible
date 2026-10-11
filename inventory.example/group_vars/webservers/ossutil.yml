@@ -1,0 +1,8 @@
+# standalone_playbooks/2-install-ossutil.yaml.
+# Uses the instance's ECS RAM role — no AccessKey here, so nothing secret; the
+# file just carries config. region is mandatory in ossutil 2.x (V4 signature).
+# Example values are for OSS Singapore.
+
+---
+ossutil_region: ap-southeast-1
+ossutil_endpoint: oss-ap-southeast-1-internal.aliyuncs.com   # -internal = free intra-Alibaba bandwidth, same region

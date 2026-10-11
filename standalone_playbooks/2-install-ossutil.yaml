@@ -1,0 +1,59 @@
+# Install Alibaba Cloud ossutil 2.x (binary is `ossutil`, distributed as an
+# arch-specific zip) and configure it for the instance's ECS RAM role via IMDSv2
+# (mode Ali-EcsRamRole); the role is auto-fetched from metadata, no AccessKey on
+# disk. The inventory provides ossutil_region, ossutil_endpoint (region mandatory in 2.x).
+
+---
+
+- name: 2. Install Alibaba ossutil (ECS RAM role)
+  hosts: webservers
+  roles:
+    - repo_defaults
+  vars:
+    ossutil_version: "2.4.0"
+    ossutil_arch: "{{ 'arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64' }}"
+    ossutil_pkg: "ossutil-{{ ossutil_version }}-linux-{{ ossutil_arch }}"
+
+  tasks:
+    - name: Check if ossutil is installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/ossutil
+      register: ossutil_bin
+
+    - name: Ensure unzip is present
+      ansible.builtin.apt:
+        name: unzip
+        state: present
+      when: not ossutil_bin.stat.exists
+
+    - name: Download and extract ossutil {{ ossutil_version }} ({{ ossutil_arch }})
+      ansible.builtin.unarchive:
+        src: "https://gosspublic.alicdn.com/ossutil/v2/{{ ossutil_version }}/{{ ossutil_pkg }}.zip"
+        dest: /tmp
+        remote_src: yes
+      when: not ossutil_bin.stat.exists
+
+    - name: Install ossutil binary
+      ansible.builtin.copy:
+        src: "/tmp/{{ ossutil_pkg }}/ossutil"
+        dest: /usr/local/bin/ossutil
+        mode: '0755'
+        remote_src: yes
+      when: not ossutil_bin.stat.exists
+
+    - name: Symlink ossutil into /usr/bin
+      ansible.builtin.file:
+        src: /usr/local/bin/ossutil
+        dest: /usr/bin/ossutil
+        state: link
+
+    - name: Clean up extracted files
+      ansible.builtin.file:
+        path: "/tmp/{{ ossutil_pkg }}"
+        state: absent
+
+    - name: Write ossutil config (~/.ossutilconfig) using the ECS RAM role
+      ansible.builtin.template:
+        src: templates/ossutilconfig.j2
+        dest: /root/.ossutilconfig
+        mode: '0600'

@@ -1,0 +1,126 @@
+# 3. Backups — secondary disaster recovery on top of the provider's disk snapshots.
+#   - daily encrypted all-databases dump to /srv/backup/db (2-day staging window)
+#   - dumps older than 2 days move to /root/.baks/db; archive kept 14 days total (find)
+#   - staging mirrors off-site: OSS daily, GCS weekly — each holds the 2 latest, timestamped
+#   - weekly /srv files mirror to GCS and/or OSS (DB dir + cache excluded)
+#   - gcs_bucket and oss_bucket are each optional (empty = skip); at least one is required
+#   - two scripts, one cron entry each: backup-db-daily, backup-offsite-weekly
+# Needs gcloud (playbook 1; the dump pass is in GCP Secret Manager) and, for OSS, ossutil
+# (playbook 2). Inventory vars: gcs_bucket and/or oss_bucket, db_dump_secret.
+# DB-dump encryption pass from GCP Secret Manager (secret: db_dump_secret).
+# Script logs go to /root/.baks/log, rotated by logrotate (daily, keep 14).
+
+---
+
+- name: 3. Backups — encrypted DB dumps + off-site /srv to GCS & OSS
+  hosts: webservers
+  roles:
+    - repo_defaults
+  tasks:
+    - name: Cron uses /bin/bash
+      ansible.builtin.cron:
+        name: SHELL
+        env: yes
+        job: /bin/bash
+
+    - name: Dump staging folder (2-day window, mirrored off-site)
+      ansible.builtin.file:
+        path: /srv/backup/db
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Local dump archive (older dumps, 14 days total)
+      ansible.builtin.file:
+        path: /root/.baks/db
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Backup log folder
+      ansible.builtin.file:
+        path: /root/.baks/log
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: logrotate for backup upload logs
+      ansible.builtin.copy:
+        dest: /etc/logrotate.d/backup-logs
+        content: |
+          /root/.baks/log/*.log {
+              daily
+              rotate 14
+              dateext
+              compress
+              delaycompress
+              missingok
+              notifempty
+              su root root
+              create 0640 root root
+          }
+
+    - name: Verify the DB-dump encryption secret is accessible
+      ansible.builtin.command: /usr/bin/gcloud secrets versions access latest --secret={{ db_dump_secret }}
+      changed_when: false
+      no_log: true
+
+    - name: At least one off-site destination is set
+      ansible.builtin.assert:
+        that: gcs_bucket | length > 0 or oss_bucket | length > 0
+        fail_msg: "Set gcs_bucket and/or oss_bucket in the inventory."
+        quiet: true
+
+    - name: Verify GCS bucket is reachable
+      ansible.builtin.command: /usr/bin/gcloud storage ls gs://{{ gcs_bucket }}
+      changed_when: false
+      when: gcs_bucket | length > 0
+
+    - name: Verify OSS bucket is reachable
+      ansible.builtin.command: /usr/bin/ossutil ls oss://{{ oss_bucket }} --limited-num 1
+      changed_when: false
+      when: oss_bucket | length > 0
+
+    - name: Backup scripts
+      ansible.builtin.template:
+        src: "templates/{{ item }}.sh.j2"
+        dest: "/usr/local/sbin/{{ item }}"
+        owner: root
+        group: root
+        mode: '0700'
+      loop:
+        - backup-db-daily
+        - backup-offsite-weekly
+
+    - name: Remove per-step backup cron entries (now inside the scripts)
+      ansible.builtin.cron:
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - db dump daily
+        - db dump archive
+        - db archive prune
+        - db to oss daily
+        - srv to gcs weekly
+        - db to gcs weekly
+        - srv to oss weekly
+
+    - name: Daily DB backup (dump, archive, prune, OSS)
+      ansible.builtin.cron:
+        name: "backup db daily"
+        minute: "30"
+        hour: "2"
+        job: >-
+          {{ '/usr/bin/cronitor exec --no-stdout backup-db-daily ' if cronitor_enabled | default(false) else '' }}/usr/local/sbin/backup-db-daily &>> /root/.baks/log/backup-db-daily.log
+
+    - name: Weekly off-site mirrors (/srv + DB staging to GCS and OSS)
+      ansible.builtin.cron:
+        name: "backup offsite weekly"
+        weekday: "0"
+        minute: "0"
+        hour: "3"
+        job: >-
+          {{ '/usr/bin/cronitor exec --no-stdout backup-offsite-weekly ' if cronitor_enabled | default(false) else '' }}/usr/local/sbin/backup-offsite-weekly &>> /root/.baks/log/backup-offsite-weekly.log

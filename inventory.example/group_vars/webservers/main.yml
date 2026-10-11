@@ -1,0 +1,27 @@
+# Host-wide settings. Defaults for anything not set here: roles/repo_defaults/defaults/main.yml.
+
+timezone: Etc/UTC
+acme_email: you@example.com       # Let's Encrypt account email (expiry notices)
+
+# Certificates use HTTP-01 (webroot) by default: each domain must already resolve to this
+# server. To use DNS-01 instead (e.g. before the DNS switch), set an acme.sh dnsapi plugin
+# and the account.conf keys it needs; the first run prompts for their values.
+# acme_challenge: dns
+# acme_dns_plugin: dns_cf                       # https://github.com/acmesh-official/acme.sh/wiki/dnsapi
+# acme_dns_cred_keys: [SAVED_CF_Token, SAVED_CF_Account_ID]
+
+# Migration interlock: pre-cutover while provisioning/migrating; post-cutover after the
+# switch. 5-rsync-migrate / 6-dbdump-migrate refuse to run unless this is pre-cutover
+# (they overwrite the destination from the frozen source).
+cutover_phase: pre-cutover
+migrate_src_ip: 192.0.2.10        # OLD server; dump/rsync are delegated here
+migrate_dest_ip: 10.0.0.2         # NEW server private IP (transfer target)
+
+# fail2ban never-ban list: your trusted IPs/CIDRs (home/office/VPN). Set before provisioning.
+f2b_ignoreip: ['203.0.113.10', '198.51.100.0/24']
+
+cronitor_enabled: false           # true after standalone_playbooks/4-cronitor.yaml + login
+
+# 7-malware-scan: reviewed files to skip while unchanged — `sha256sum <file>` output lines
+malware_scan_allow: []
+#  - "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  /srv/www/example/wp-content/uploads/wpforms/cache/index.php"

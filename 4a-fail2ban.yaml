@@ -1,0 +1,200 @@
+# fail2ban jails: WordPress (journald) + nginx (access/error log), native nftables action.
+# The nginx-* filters parse the apm access-log format defined in 4-nginx; if that
+# log_format changes, these failregex must change too. They are anchored with
+# ^[^=]*server_name=... so client= can only match the real field, never text a
+# client injected into referer/user_agent (the date prefix has no '=').
+
+---
+
+- name: 4a. fail2ban jails (WordPress journald + nginx logs)
+  hosts: webservers
+  roles:
+    - repo_defaults
+  tasks:
+    # Fetch filters from the plugin SVN; pin wpf2b_ref to your plugin version.
+    - name: Fetch current WordPress fail2ban filters from the plugin SVN
+      ansible.builtin.get_url:
+        url: "https://plugins.svn.wordpress.org/wp-fail2ban/{{ wpf2b_ref }}/filters.d/{{ item }}"
+        dest: "/etc/fail2ban/filter.d/{{ item }}"
+      loop:
+        - wordpress-hard.conf
+        - wordpress-soft.conf
+        - wordpress-extra.conf
+      notify: Reload fail2ban
+
+    - name: Install nginx-access-forbidden filter
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/filter.d/nginx-access-forbidden.conf
+        content: |
+          [Definition]
+          failregex = ^.* \[error\] \d+#\d+: .* forbidden .*, client: <HOST>, .*$
+          ignoreregex =
+      notify: Reload fail2ban
+
+    - name: Install nginx-scan filter (probe detector for the apm access-log format)
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/filter.d/nginx-scan.conf
+        content: |
+          [Definition]
+          # Matches 404s on config/secret/exec paths, not ordinary missing assets.
+          # IP is in client= (apm format).
+          failregex = ^[^=]*server_name=\S* (?:host=\S* )?client=<HOST> method=\S+ request="[A-Z]+ [^"]*\.(php|env|git|json|ya?ml|ini|conf|sql|bak|sh|asp|jsp|cgi|pl)[^"]*" request_length=\d+ status=404
+          datepattern = ^"%%d/%%b/%%Y:%%H:%%M:%%S
+          ignoreregex =
+      notify: Reload fail2ban
+
+    - name: Install nginx-wplogin filter (failed wp-login POSTs; independent of journald)
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/filter.d/nginx-wplogin.conf
+        content: |
+          [Definition]
+          # Failed wp-login POST = status 200 (login re-rendered); a success is 302.
+          failregex = ^[^=]*server_name=\S* (?:host=\S* )?client=<HOST> method=POST request="POST /wp-login\.php[^"]*" request_length=\d+ status=200
+          datepattern = ^"%%d/%%b/%%Y:%%H:%%M:%%S
+          ignoreregex =
+      notify: Reload fail2ban
+
+    - name: Configure fail2ban jails (nftables backend)
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [DEFAULT]
+          # journalflags=1 also opens per-user journals; wp-fail2ban logs there because
+          # php-fpm runs as UID>=1000 (the systemd default reads only system.journal).
+          backend = systemd[journalflags=1]
+          banaction = nftables-multiport
+          banaction_allports = nftables-allports
+          # Never-ban list; trusted IPs come from the inventory (f2b_ignoreip).
+          ignoreip = 127.0.0.1/8 ::1 {{ (f2b_ignoreip | default([])) | join(' ') }}
+          bantime = 1w
+          findtime = 12h
+          maxretry = 3
+
+          [sshd]
+          enabled = true
+
+          [wordpress-hard]
+          enabled = true
+          filter = wordpress-hard
+          journalmatch = SYSLOG_IDENTIFIER=wordpress
+          port = http,https
+          maxretry = 1
+
+          [wordpress-soft]
+          enabled = true
+          filter = wordpress-soft
+          journalmatch = SYSLOG_IDENTIFIER=wordpress
+          port = http,https
+          maxretry = 3
+
+          # Disabled: this filter also matches legit events (e.g. real comments).
+          [wordpress-extra]
+          enabled = false
+          filter = wordpress-extra
+          journalmatch = SYSLOG_IDENTIFIER=wordpress
+          port = http,https
+          maxretry = 3
+
+          # Denied dotfile/xmlrpc/wp-config probes (from error.log).
+          [nginx-access-forbidden]
+          enabled = true
+          backend = auto
+          filter = nginx-access-forbidden
+          logpath = /var/log/nginx/error.log
+          port = http,https
+          maxretry = 6
+
+          # Bans IPs that repeatedly trip nginx limit_req (503s in error.log).
+          [nginx-limit-req]
+          enabled = true
+          backend = auto
+          filter = nginx-limit-req
+          logpath = /var/log/nginx/error.log
+          findtime = 60
+          maxretry = 10
+          port = http,https
+
+          # Many 404s on config/secret/exec paths (from access.log).
+          [nginx-scan]
+          enabled = true
+          backend = auto
+          filter = nginx-scan
+          logpath = /var/log/nginx/access.log
+          findtime = 60
+          maxretry = 15
+          port = http,https
+
+          # Failed wp-login POSTs from access.log (independent of the journald path).
+          [nginx-wplogin]
+          enabled = true
+          backend = auto
+          filter = nginx-wplogin
+          logpath = /var/log/nginx/access.log
+          findtime = 300
+          maxretry = 5
+          port = http,https
+      notify: Reload fail2ban
+
+    - name: Remove non-systemd Debian defaults jail (superseded by jail.local)
+      ansible.builtin.file:
+        path: /etc/fail2ban/jail.d/defaults-debian.conf
+        state: absent
+      notify: Reload fail2ban
+
+    - name: fail2ban enabled and running
+      ansible.builtin.systemd:
+        name: fail2ban
+        enabled: true
+        state: started
+
+    - name: Apply changed fail2ban config before verifying
+      ansible.builtin.meta: flush_handlers
+
+    # Verification: assert each nginx filter matches a known-good line, so a filter that
+    # loads but matches nothing fails the run instead of passing silently.
+    - name: Verify — fail2ban is up and jails are loaded
+      ansible.builtin.command: fail2ban-client status
+      register: f2b_status
+      changed_when: false
+
+    - name: Verify — nginx filters match a known-good apm log line
+      ansible.builtin.command:
+        argv:
+          - fail2ban-regex
+          - "{{ item.line }}"
+          - "/etc/fail2ban/filter.d/{{ item.filter }}"
+      register: f2b_selftest
+      changed_when: false
+      failed_when: f2b_selftest.stdout is not search(', ' ~ item.expect ~ ' matched,')
+      loop:
+        - filter: nginx-wplogin.conf
+          expect: 1
+          line: '"01/Jan/2026:00:00:00 +0900" server_name=t host=t client=192.0.2.1 method=POST request="POST /wp-login.php HTTP/1.1" request_length=1 status=200 bytes_sent=1'
+        - filter: nginx-scan.conf
+          expect: 1
+          line: '"01/Jan/2026:00:00:00 +0900" server_name=t host=t client=192.0.2.1 method=GET request="GET /phpinfo.php HTTP/1.1" request_length=1 status=404 bytes_sent=1'
+        # Injection: a benign request whose referer forges a probe line for another IP.
+        # Must NOT match — otherwise any client can get arbitrary IPs banned.
+        - filter: nginx-scan.conf
+          expect: 0
+          line: '"01/Jan/2026:00:00:00 +0900" server_name=t host=t client=192.0.2.1 method=GET request="GET / HTTP/1.1" request_length=1 status=200 bytes_sent=1 referer="x client=203.0.113.9 method=GET request="GET /a.php HTTP/1.1" request_length=1 status=404" user_agent="x"'
+      loop_control:
+        label: "{{ item.filter }} expect={{ item.expect }}"
+
+    - name: Show self-test evidence (fail2ban-regex summary per line)
+      ansible.builtin.debug:
+        msg: "{{ item.item.filter }} expect={{ item.item.expect }} -> {{ item.stdout | regex_search('Lines: [^\\n]*') }}"
+      loop: "{{ f2b_selftest.results }}"
+      loop_control:
+        label: "{{ item.item.filter }}"
+      when: item.stdout is defined   # skipped under --check
+
+    - name: Show loaded fail2ban jails
+      ansible.builtin.debug:
+        var: f2b_status.stdout_lines
+
+  handlers:
+    - name: Reload fail2ban
+      ansible.builtin.systemd:
+        name: fail2ban
+        state: reloaded

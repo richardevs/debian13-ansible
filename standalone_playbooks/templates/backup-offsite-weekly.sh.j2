@@ -1,0 +1,31 @@
+#!/bin/bash
+# Weekly off-site mirrors: /srv to GCS and/or OSS (DB staging + WP cache
+# excluded), DB staging to GCS. Every mirror runs even if an earlier one
+# fails; exits non-zero if any failed.
+set -uo pipefail
+
+log() { echo "$(date +%FT%T%z) $*"; }
+rc=0
+step() {
+  local name=$1; shift
+  log "start $name"
+  if "$@"; then log "ok $name"; else log "FAILED $name"; rc=1; fi
+}
+
+{% if gcs_bucket %}
+step srv-to-gcs gcloud storage rsync -r \
+  -x '(^|.*/)wp-content/cache/.*|(^|.*/)backup/db/.*' \
+  /srv gs://{{ gcs_bucket }}/srv --delete-unmatched-destination-objects
+
+step db-to-gcs gcloud storage rsync -r \
+  /srv/backup/db gs://{{ gcs_bucket }}/db --delete-unmatched-destination-objects
+{% endif %}
+{% if oss_bucket %}
+
+step srv-to-oss ossutil sync /srv oss://{{ oss_bucket }}/srv \
+  --exclude "*/wp-content/cache/*" --exclude "*/backup/db/*" \
+  --acl private --update --delete --force
+{% endif %}
+
+log "$( ((rc == 0)) && echo OK || echo FAILED )"
+exit $rc

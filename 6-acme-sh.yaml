@@ -1,0 +1,156 @@
+# acme.sh + Let's Encrypt, gated on per-site `tls: true`.
+# HTTP-01 webroot by default (the domain must resolve to this host first). A site, or the
+# whole inventory, can set acme_challenge: dns to use DNS-01 via acme_dns_plugin.
+
+---
+
+- name: 6. acme.sh + Let's Encrypt certificates
+  hosts: webservers
+  roles:
+    - repo_defaults
+  tasks:
+    - name: Check for existing acme.sh
+      ansible.builtin.stat:
+        path: /root/.acme.sh/acme.sh
+      register: acme_path
+
+    - name: Clone acme.sh
+      ansible.builtin.git:
+        repo: 'https://github.com/acmesh-official/acme.sh.git'
+        dest: /root/acme.sh
+      when: not acme_path.stat.exists
+
+    - name: Install acme.sh (register account email for expiry notices)
+      ansible.builtin.command: ./acme.sh --install --nocron {{ ('--accountemail ' + acme_email) if acme_email else '' }}
+      args:
+        chdir: /root/acme.sh
+      when: not acme_path.stat.exists
+
+    - name: Remove clone dir
+      ansible.builtin.file:
+        path: /root/acme.sh
+        state: absent
+
+    - name: Read root crontab
+      ansible.builtin.command: crontab -l
+      register: root_crontab
+      changed_when: false
+      failed_when: false
+
+    # deletes every line containing "acme.sh --cron", so only before the managed entry exists
+    - name: Remove acme.sh's self-installed cron entry
+      ansible.builtin.command: /root/.acme.sh/acme.sh --uninstall-cronjob
+      when:
+        - "'acme.sh --cron' in root_crontab.stdout"
+        - "'#Ansible: acme renew' not in root_crontab.stdout"
+
+    - name: Cert renewal cron
+      ansible.builtin.cron:
+        name: "acme renew"
+        minute: "47"
+        hour: "3,9,15,21"
+        job: >-
+          {{ '/usr/bin/cronitor exec --no-stdout acme-renew ' if cronitor_enabled | default(false) else '' }}"/root/.acme.sh"/acme.sh --cron --home "/root/.acme.sh" > /dev/null
+
+    - name: Set default CA to Let's Encrypt
+      ansible.builtin.command: /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+      changed_when: false
+
+    - name: Sites that use DNS-01
+      ansible.builtin.set_fact:
+        acme_dns_sites: >-
+          {{ users | selectattr('tls', 'defined') | selectattr('tls')
+             | selectattr('acme_challenge', 'defined') | selectattr('acme_challenge', 'equalto', 'dns') | list
+             + (users | selectattr('tls', 'defined') | selectattr('tls') | rejectattr('acme_challenge', 'defined') | list
+                if acme_challenge == 'dns' else []) }}
+
+    - name: DNS-01 needs a DNS plugin
+      ansible.builtin.assert:
+        that: acme_dns_plugin | length > 0
+        fail_msg: >-
+          Sites {{ acme_dns_sites | map(attribute='name') | join(', ') }} use DNS-01, but acme_dns_plugin is
+          not set. Set acme_dns_plugin (an acme.sh dnsapi name) and acme_dns_cred_keys in the inventory.
+        quiet: true
+      when: acme_dns_sites | length > 0
+
+    - name: DNS-plugin credentials (DNS-01 sites only)
+      when: acme_dns_sites | length > 0
+      block:
+        # Credentials come from <inventory>/secrets/acme-sh.conf when it exists (also how to rotate them);
+        # otherwise the server's account.conf is kept; otherwise the run prompts for each key.
+        - name: Check for a local DNS-plugin credentials file
+          ansible.builtin.stat:
+            path: "{{ inventory_dir }}/secrets/acme-sh.conf"
+          register: acme_local_creds
+          delegate_to: localhost
+          become: false
+
+        - name: Read the server's acme.sh account.conf
+          ansible.builtin.slurp:
+            src: /root/.acme.sh/account.conf
+          register: acme_account_conf
+          no_log: true
+
+        - name: Note which DNS-plugin credential keys the server already has
+          ansible.builtin.set_fact:
+            acme_creds_on_server: >-
+              {{ acme_dns_cred_keys | select('in', (acme_account_conf.content | b64decode
+                 | regex_findall('(?m)^([A-Z0-9_]+)='))) | list | length == acme_dns_cred_keys | length }}
+
+        - name: Prompt for missing DNS-plugin credentials (hidden input)
+          ansible.builtin.pause:
+            prompt: "No <inventory>/secrets/acme-sh.conf and no {{ acme_dns_plugin }} credentials on the server. Enter {{ item }}"
+            echo: false
+          loop: "{{ acme_dns_cred_keys }}"
+          register: acme_prompted
+          when: not acme_local_creds.stat.exists and not acme_creds_on_server
+
+        - name: Write DNS-plugin credentials into account.conf
+          ansible.builtin.blockinfile:
+            block: |-
+              {% if acme_local_creds.stat.exists %}{{ lookup('ansible.builtin.file', inventory_dir ~ '/secrets/acme-sh.conf') }}{% else %}{% for r in acme_prompted.results %}{{ r.item }}='{{ r.user_input }}'
+              {% endfor %}{% endif %}
+            path: /root/.acme.sh/account.conf
+          when: acme_local_creds.stat.exists or not acme_creds_on_server
+          no_log: true
+
+    - name: Confirm issuance
+      ansible.builtin.pause:
+        prompt: "acme account email: {{ acme_email or 'UNSET — no LE expiry warnings' }}. Issue certs for tls:true sites now — HTTP-01, or DNS-01 via {{ acme_dns_plugin or '(no plugin)' }} where acme_challenge is dns (y/n)?"
+      register: issuenow
+
+    - name: Issue SSL certificates (DNS-01)
+      ansible.builtin.command: /root/.acme.sh/acme.sh --issue --dns {{ acme_dns_plugin }} --dnssleep {{ acme_dnssleep }} --keylength ec-256 {% for i in item.domain %}-d {{ i }} {% endfor %}
+      with_items: '{{ users }}'
+      register: issue_dns
+      # acme.sh exits 2 (RENEW_SKIP) when the cert exists and is not due.
+      failed_when: "issue_dns.rc != 0 and issue_dns.rc != 2"
+      changed_when: issue_dns.rc == 0
+      when:
+        - issuenow.user_input == 'y'
+        - item.tls | default(false)
+        - (item.acme_challenge | default(acme_challenge)) == 'dns'
+
+    - name: Issue SSL certificates (HTTP-01 webroot; domain must resolve to this host)
+      ansible.builtin.command: /root/.acme.sh/acme.sh --issue -w /usr/share/nginx/html --keylength ec-256 {% for i in item.domain %}-d {{ i }} {% endfor %}
+      with_items: '{{ users }}'
+      register: issue_http
+      # acme.sh exits 2 (RENEW_SKIP) when the cert exists and is not due.
+      failed_when: "issue_http.rc != 0 and issue_http.rc != 2"
+      changed_when: issue_http.rc == 0
+      when:
+        - issuenow.user_input == 'y'
+        - item.tls | default(false)
+        - (item.acme_challenge | default(acme_challenge)) != 'dns'
+
+    - name: Install certificates to nginx
+      ansible.builtin.command: |
+        /root/.acme.sh/acme.sh --install-cert {% for i in item.domain %}-d {{ i }} {% endfor %} \
+        --cert-file      /root/.certs/{{ item.name }}/cert.pem \
+        --key-file       /root/.certs/{{ item.name }}/key.pem  \
+        --fullchain-file /root/.certs/{{ item.name }}/fullchain.pem \
+        --reloadcmd      "systemctl reload nginx.service"
+      with_items: '{{ users }}'
+      when:
+        - issuenow.user_input == 'y'
+        - item.tls | default(false)

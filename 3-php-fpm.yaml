@@ -1,0 +1,43 @@
+# One php-fpm pool per php-enabled site, each running as that site's user and
+# listening on a private unix socket /run/php/<name>-fpm.sock (owner nginx, 0600).
+
+---
+
+- name: 3. Per-site php-fpm pools (unix sockets)
+  hosts: webservers
+  roles:
+    - repo_defaults
+  tasks:
+    - name: Apply PHP hardening drop-in (conf.d, scanned after php.ini)
+      ansible.builtin.copy:
+        src: files/php-hardening.ini
+        dest: "/etc/php/{{ php_version }}/fpm/conf.d/99-hardening.ini"
+      notify: Reload php-fpm
+
+    # templates/pool.conf.j2 is the stock pool.d/www.conf from Debian 13 php8.4-fpm
+    # 8.4.26-1~deb13u1 with only the pool's settings changed. To diff against the current stock
+    # file, on the server:
+    #   cd $(mktemp -d) && apt-get download php8.4-fpm && dpkg-deb -x php8.4-fpm_*.deb x &&
+    #   diff x/etc/php/8.4/fpm/pool.d/www.conf /etc/php/8.4/fpm/pool.d/<site>.conf
+    - name: Create per-site pool conf (php_enabled sites)
+      ansible.builtin.template:
+        src: templates/pool.conf.j2
+        dest: "/etc/php/{{ php_version }}/fpm/pool.d/{{ item.name }}.conf"
+        # the stock file's comments contain "{%"; the template uses no blocks
+        block_start_string: "[%"
+        block_end_string: "%]"
+      with_items: '{{ users }}'
+      when: item.php_enabled | default(false)
+      notify: Reload php-fpm
+
+    - name: Remove the default www.conf pool
+      ansible.builtin.file:
+        path: "/etc/php/{{ php_version }}/fpm/pool.d/www.conf"
+        state: absent
+      notify: Reload php-fpm
+
+  handlers:
+    - name: Reload php-fpm
+      ansible.builtin.systemd:
+        name: "php{{ php_version }}-fpm"
+        state: reloaded
