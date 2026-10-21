@@ -30,6 +30,14 @@
         mode: '0700'
       with_items: '{{ users }}'
 
+    # One remote call; the tasks below then skip existing files without connecting.
+    - name: List existing site keys, certs and override snippets
+      ansible.builtin.find:
+        paths: [/root/.certs, /etc/nginx/snippets]
+        patterns: [key.pem, fullchain.pem, '*.extra.conf']
+        recurse: true
+      register: site_files
+
     - name: Seed snakeoil key until acme.sh replaces it
       ansible.builtin.copy:
         src: /etc/ssl/private/ssl-cert-snakeoil.key
@@ -37,6 +45,7 @@
         remote_src: yes
         force: false
       with_items: '{{ users }}'
+      when: ('/root/.certs/' ~ item.name ~ '/key.pem') not in (site_files.files | map(attribute='path'))
 
     - name: Seed snakeoil cert until acme.sh replaces it
       ansible.builtin.copy:
@@ -45,6 +54,7 @@
         remote_src: yes
         force: false
       with_items: '{{ users }}'
+      when: ('/root/.certs/' ~ item.name ~ '/fullchain.pem') not in (site_files.files | map(attribute='path'))
 
     # Escape hatch: hand-written per-site overrides. Created empty ONCE and
     # never clobbered (force:false), so re-runs don't wipe your edits.
@@ -58,6 +68,7 @@
           # from common.conf — re-add them (or `include snippets/common.conf;`) in that block.
         force: false
       with_items: '{{ users }}'
+      when: ('/etc/nginx/snippets/' ~ item.name ~ '.extra.conf') not in (site_files.files | map(attribute='path'))
 
     - name: Generate per-site vhost
       ansible.builtin.template:
