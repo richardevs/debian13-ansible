@@ -6,6 +6,10 @@ messages and design docs (e.g. `ACL_DESIGN.md`).
 ## [Unreleased]
 
 ### Changed
+- PHP-FPM: `session.upload_progress.enabled = 0`; removed deprecated `session.sid_length` and
+  `session.sid_bits_per_character`
+- PHP-FPM: `open_basedir` set per pool (`php_admin_value`) instead of nginx `PHP_ADMIN_VALUE`
+- nginx: `client_max_body_size` 20m → 8m
 - nginx: shared deny rule also covers `.log`, `.sql.gz` and trailing-`~` editor backups
 - PHP-FPM: `expose_php = Off`
 

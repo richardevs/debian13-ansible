@@ -45,7 +45,7 @@ environment, for example the backup and monitoring playbooks.
 - Additional controls:
   - nginx blocks requests for `*.php` files under all `wp-content/`, `uploads/` and `files/` directories.
   - nginx blocks requests for `xmlrpc.php` and `wp-config.php`.
-  - nginx sets the PHP `open_basedir` value for each site.
+  - Each site's php-fpm pool sets the PHP `open_basedir` value for that site.
 - **`wp-config.php` has the mode `440` (read-only)**. The file contains the database
   credentials, and WordPress does not write to it during operation. The read-only mode
   stops simple attacks that try to overwrite `wp-config.php`. The owner can change the
