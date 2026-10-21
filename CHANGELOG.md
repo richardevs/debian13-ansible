@@ -5,6 +5,10 @@ messages and design docs (e.g. `ACL_DESIGN.md`).
 
 ## [Unreleased]
 
+### Changed
+- nginx: shared deny rule also covers `.log`, `.sql.gz` and trailing-`~` editor backups
+- PHP-FPM: `expose_php = Off`
+
 ## [1.0.0] - 2026-10-11
 
 First public release. Successor to `debian12-ansible`. Requires ansible-core 2.18 or later;

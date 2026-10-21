@@ -108,6 +108,11 @@ To add an nginx setting for one site that the template does not have, edit
 `/etc/nginx/snippets/<name>.extra.conf` on the server. The site configuration includes
 this file. Ansible **never overwrites** it.
 
+The shared config denies `.sql`, `.sql.gz`, `.log`, editor backups (`*~`, `.bak`, `.swp`, …)
+and dotfiles. These are regex locations and the shared config is included first, so a regex
+location in `extra.conf` cannot override them. To serve such a file, use an exact
+(`location = /path/file.log`) or a `^~` prefix location.
+
 ### Drift check (dry run)
 
 This command shows the differences between the live server and the repository. It
